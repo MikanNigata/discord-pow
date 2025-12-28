@@ -17,7 +17,21 @@
 				"POW_COMMAND_NAME": "pow2"
 			}
 		}
-	}
+	},
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "NONCE_STORE",
+				"class_name": "NonceStore"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_classes": ["NonceStore"]
+		}
+	]
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement

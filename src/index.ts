@@ -7,6 +7,7 @@ interface Env {
   POW_SECRET: string;
   POW_COMMAND_NAME?: string;
   ENABLE_VERIFY_BUTTON?: string;
+  NONCE_STORE: DurableObjectNamespace;
 }
 
 // まずはUX優先で軽め推奨（重ければ下げ、軽すぎれば上げる）
@@ -46,6 +47,10 @@ async function sha256Utf8(data: string): Promise<Uint8Array> {
   const enc = new TextEncoder();
   const digest = await crypto.subtle.digest("SHA-256", enc.encode(data));
   return new Uint8Array(digest);
+}
+
+async function sha256Base64Url(data: string): Promise<string> {
+  return u8ToBase64Url(await sha256Utf8(data));
 }
 
 function hasLeadingZeroBits(buf: Uint8Array, zeroBits: number): boolean {
@@ -161,11 +166,11 @@ async function verifyDiscordSig(req: Request, env: Env, bodyText: string): Promi
 // -------------------- token / pow --------------------
 async function makeToken(env: Env, guildId: string, userId: string): Promise<string> {
   const ts = Math.floor(Date.now() / 1000);
-  const rand = crypto.getRandomValues(new Uint8Array(16));
-  const randB64u = u8ToBase64Url(rand);
+  const tokenNonce = crypto.getRandomValues(new Uint8Array(16));
+  const nonceB64u = u8ToBase64Url(tokenNonce);
 
-  // pow.v1.rand.guildId.userId.ts.diff.sig
-  const payload = `pow.v1.${randB64u}.${guildId}.${userId}.${ts}.${DIFFICULTY}`;
+  // pow.v1.nonce.guildId.userId.ts.diff.sig
+  const payload = `pow.v1.${nonceB64u}.${guildId}.${userId}.${ts}.${DIFFICULTY}`;
   const sig = await hmacSha256Base64Url(env.POW_SECRET, payload);
   return `${payload}.${sig}`;
 }
@@ -175,6 +180,7 @@ function parseToken(token: string) {
   if (parts.length !== 8 || parts[0] !== "pow" || parts[1] !== "v1") return null;
   const payload = parts.slice(0, 7).join(".");
   return {
+    nonce: parts[2],
     guildId: parts[3],
     userId: parts[4],
     ts: Number(parts[5]),
@@ -217,7 +223,32 @@ async function verifyTokenAndPow(env: Env, tokenRaw: string, nonceRaw: string) {
     };
   }
 
-  return { ok: true as const, guildId: parsed.guildId, userId: parsed.userId };
+  return {
+    ok: true as const,
+    guildId: parsed.guildId,
+    userId: parsed.userId,
+    tokenNonce: parsed.nonce,
+    expiresAt: parsed.ts + POW_TTL_SEC,
+  };
+}
+
+async function checkAndMarkNonce(
+  env: Env,
+  tokenNonce: string,
+  expiresAt: number
+): Promise<{ ok: true } | { ok: false; status: number; msg: string }> {
+  const nonceHash = await sha256Base64Url(tokenNonce);
+  const id = env.NONCE_STORE.idFromName(nonceHash);
+  const stub = env.NONCE_STORE.get(id);
+  const res = await stub.fetch("https://nonce-store/check", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ expiresAt }),
+  });
+
+  if (res.status === 409) return { ok: false, status: 409, msg: "nonce already used" };
+  if (!res.ok) return { ok: false, status: res.status, msg: "nonce check failed" };
+  return { ok: true };
 }
 
 // -------------------- role grant --------------------
@@ -293,7 +324,7 @@ if (!token) {
 
 function parseDiff(tok) {
   const parts = tok.split(".");
-  return Number(parts[6]); // pow.v1.rand.guildId.userId.ts.diff.sig
+  return Number(parts[6]); // pow.v1.nonce.guildId.userId.ts.diff.sig
 }
 
 const diff = token ? parseDiff(token) : NaN;
@@ -486,6 +517,9 @@ export default {
           const v = await verifyTokenAndPow(env, token, nonce);
           if (!v.ok) return json(ephemeral(v.msg));
 
+          const nonceCheck = await checkAndMarkNonce(env, v.tokenNonce, v.expiresAt);
+          if (!nonceCheck.ok) return json(ephemeral(nonceCheck.msg));
+
           const res = await addRoleDetailed(env, v.guildId, v.userId);
           if (!res.ok) {
             return json(ephemeral(`ロール付与に失敗: status=${res.status} body=${res.body || "(empty)"}`));
@@ -522,6 +556,9 @@ export default {
       const v = await verifyTokenAndPow(env, token, nonce);
       if (!v.ok) return json({ ok: false, error: v.msg, debug: (v as any).debug }, 400);
 
+      const nonceCheck = await checkAndMarkNonce(env, v.tokenNonce, v.expiresAt);
+      if (!nonceCheck.ok) return json({ ok: false, error: nonceCheck.msg }, nonceCheck.status);
+
       const res = await addRoleDetailed(env, v.guildId, v.userId);
       if (!res.ok) {
         // ここがあなたのログで失敗している箇所。status/bodyを返して原因を見える化する。
@@ -534,3 +571,36 @@ export default {
     return new Response("not found", { status: 404 });
   },
 };
+
+export class NonceStore {
+  private state: DurableObjectState;
+
+  constructor(state: DurableObjectState) {
+    this.state = state;
+  }
+
+  async fetch(req: Request): Promise<Response> {
+    if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+
+    let body: any;
+    try {
+      body = await req.json();
+    } catch {
+      return new Response("invalid json", { status: 400 });
+    }
+
+    const expiresAt = Number(body?.expiresAt ?? 0);
+    if (!Number.isFinite(expiresAt) || expiresAt <= 0) {
+      return new Response("invalid expiresAt", { status: 400 });
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    if (now > expiresAt) return new Response("expired", { status: 400 });
+
+    const existing = await this.state.storage.get("used");
+    if (existing) return new Response("used", { status: 409 });
+
+    await this.state.storage.put("used", { usedAt: now }, { expiration: expiresAt });
+    return new Response("ok");
+  }
+}
