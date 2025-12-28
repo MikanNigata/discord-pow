@@ -1,18 +1,490 @@
-/**
- * Welcome to Cloudflare Workers! This is your first worker.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run `npm run deploy` to publish your worker
- *
- * Bind resources to your worker in `wrangler.jsonc`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/workers/
- */
+import nacl from "tweetnacl";
 
+interface Env {
+  DISCORD_PUBLIC_KEY: string; // hex
+  DISCORD_BOT_TOKEN: string;
+  VERIFIED_ROLE_ID: string;
+  POW_SECRET: string;
+}
+
+// まずはUX優先で軽め推奨（重ければ下げ、軽すぎれば上げる）
+const POW_TTL_SEC = 600; // 10分
+const DIFFICULTY = 18;   // 16〜20あたりで調整
+
+// -------------------- util --------------------
+function hexToU8(hex: string): Uint8Array {
+  const clean = hex.startsWith("0x") ? hex.slice(2) : hex;
+  if (clean.length % 2 !== 0) throw new Error("invalid hex");
+  const out = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+
+function u8ToBase64Url(u8: Uint8Array): string {
+  let s = "";
+  for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+  const b64 = btoa(s);
+  return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+async function hmacSha256Base64Url(secret: string, data: string): Promise<string> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(data));
+  return u8ToBase64Url(new Uint8Array(sig));
+}
+
+async function sha256Utf8(data: string): Promise<Uint8Array> {
+  const enc = new TextEncoder();
+  const digest = await crypto.subtle.digest("SHA-256", enc.encode(data));
+  return new Uint8Array(digest);
+}
+
+function hasLeadingZeroBits(buf: Uint8Array, zeroBits: number): boolean {
+  let bits = zeroBits;
+  for (let i = 0; i < buf.length; i++) {
+    if (bits <= 0) return true;
+    const b = buf[i];
+    if (bits >= 8) {
+      if (b !== 0) return false;
+      bits -= 8;
+    } else {
+      const mask = 0xff << (8 - bits);
+      return (b & mask) === 0;
+    }
+  }
+  return bits <= 0;
+}
+
+function constantTimeEq(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  const ae = new TextEncoder().encode(a);
+  const be = new TextEncoder().encode(b);
+  let diff = 0;
+  for (let i = 0; i < ae.length; i++) diff |= (ae[i] ^ be[i]);
+  return diff === 0;
+}
+
+function json(obj: unknown, status = 200): Response {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+    },
+  });
+}
+
+function html(body: string, status = 200): Response {
+  return new Response(body, {
+    status,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "referrer-policy": "no-referrer",
+      // 最低限のCSP（必要なら後で調整）
+      "content-security-policy": "default-src 'self'; script-src 'self' 'unsafe-inline' blob:; worker-src 'self' blob:; connect-src 'self'; style-src 'self' 'unsafe-inline';",
+    },
+  });
+}
+
+function ephemeral(content: string) {
+  return { type: 4, data: { content, flags: 64 } };
+}
+
+function ephemeralWithLink(content: string, url: string) {
+  // Link button (style=5)
+  return {
+    type: 4,
+    data: {
+      content,
+      flags: 64,
+      components: [
+        {
+          type: 1,
+          components: [{ type: 2, style: 5, label: "PoW認証を開始", url }],
+        },
+      ],
+    },
+  };
+}
+
+function parseOptions(interaction: any): Record<string, any> {
+  const opts = interaction?.data?.options ?? [];
+  const out: Record<string, any> = {};
+  for (const o of opts) out[o.name] = o.value;
+  return out;
+}
+
+// -------------------- Discord verification --------------------
+async function verifyDiscordSig(req: Request, env: Env, bodyText: string): Promise<boolean> {
+  const sigHex = req.headers.get("x-signature-ed25519");
+  const ts = req.headers.get("x-signature-timestamp");
+  if (!sigHex || !ts) return false;
+
+  const msg = new TextEncoder().encode(ts + bodyText);
+  const sig = hexToU8(sigHex);
+  const pub = hexToU8(env.DISCORD_PUBLIC_KEY);
+  return nacl.sign.detached.verify(msg, sig, pub);
+}
+
+// -------------------- token / pow --------------------
+async function makeToken(env: Env, guildId: string, userId: string): Promise<string> {
+  const ts = Math.floor(Date.now() / 1000);
+  const rand = crypto.getRandomValues(new Uint8Array(16));
+  const randB64u = u8ToBase64Url(rand);
+
+  // pow.v1.rand.guildId.userId.ts.diff.sig
+  const payload = `pow.v1.${randB64u}.${guildId}.${userId}.${ts}.${DIFFICULTY}`;
+  const sig = await hmacSha256Base64Url(env.POW_SECRET, payload);
+  return `${payload}.${sig}`;
+}
+
+function parseToken(token: string) {
+  const parts = token.split(".");
+  if (parts.length !== 8 || parts[0] !== "pow" || parts[1] !== "v1") return null;
+  const payload = parts.slice(0, 7).join(".");
+  return {
+    guildId: parts[3],
+    userId: parts[4],
+    ts: Number(parts[5]),
+    diff: Number(parts[6]),
+    sig: parts[7],
+    payload,
+  };
+}
+
+async function verifyTokenAndPow(env: Env, tokenRaw: string, nonceRaw: string) {
+  const token = tokenRaw.trim();
+  const nonce = nonceRaw.trim();
+
+  const parsed = parseToken(token);
+  if (!parsed) return { ok: false, msg: "token形式が不正です。" as const };
+
+  if (!Number.isFinite(parsed.ts) || !Number.isFinite(parsed.diff)) {
+    return { ok: false, msg: "tokenが壊れています。" as const };
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  if (now - parsed.ts > POW_TTL_SEC) {
+    return { ok: false, msg: "期限切れです。Discordで /pow からやり直してください。" as const };
+  }
+
+  const expected = await hmacSha256Base64Url(env.POW_SECRET, parsed.payload);
+  if (!constantTimeEq(expected, parsed.sig)) {
+    return { ok: false, msg: "署名が不正です。" as const };
+  }
+
+  const h = await sha256Utf8(`${token}.${nonce}`);
+  if (!hasLeadingZeroBits(h, parsed.diff)) {
+    const hex4 = Array.from(h.slice(0, 4))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+    return {
+      ok: false,
+      msg: "PoWが不正です（条件未達）。" as const,
+      debug: { diff: parsed.diff, hash_first4: hex4 },
+    };
+  }
+
+  return { ok: true as const, guildId: parsed.guildId, userId: parsed.userId };
+}
+
+// -------------------- role grant --------------------
+async function addRoleDetailed(env: Env, guildId: string, userId: string) {
+  const url = `https://discord.com/api/v10/guilds/${guildId}/members/${userId}/roles/${env.VERIFIED_ROLE_ID}`;
+  const r = await fetch(url, {
+    method: "PUT",
+    headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}` },
+  });
+  const body = await r.text().catch(() => "");
+  return { ok: r.status === 204 || r.ok, status: r.status, body };
+}
+
+// -------------------- verify page --------------------
+function verifyPageHtml(): string {
+  // tokenはURLフラグメント(#t=)から読む（サーバーに送られない）
+  return `<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>PoW認証</title>
+  <meta http-equiv="Cache-Control" content="no-store" />
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:820px;margin:40px auto;padding:0 16px;line-height:1.6}
+    .card{border:1px solid #ddd;border-radius:12px;padding:16px}
+    .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+    button{padding:10px 14px;border-radius:10px;border:1px solid #333;background:#111;color:#fff;cursor:pointer}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    .muted{color:#666}
+    .ok{color:#0a7}
+    .ng{color:#c33}
+    pre{white-space:pre-wrap;word-break:break-all;background:#f7f7f7;padding:10px;border-radius:10px}
+    .small{font-size:13px}
+  </style>
+</head>
+<body>
+  <h1>PoW認証</h1>
+  <div class="card">
+    <p class="muted">このページでPoWを計算し、完了すると自動でDiscordのロールが付与されます。</p>
+    <div class="row">
+      <button id="start">計算を開始</button>
+      <span id="status" class="muted">待機中</span>
+    </div>
+    <p class="muted">進捗: <span id="progress">-</span></p>
+    <pre id="detail">-</pre>
+    <p class="small muted">注意: 失敗する場合はBotの権限（Manage Roles）とロール階層（Botロールが対象ロールより上）を確認してください。</p>
+  </div>
+
+<script>
+const startBtn = document.getElementById("start");
+const statusEl = document.getElementById("status");
+const progressEl = document.getElementById("progress");
+const detailEl = document.getElementById("detail");
+
+function setStatus(text, cls) {
+  statusEl.textContent = text;
+  statusEl.className = cls || "muted";
+}
+
+function getTokenFromHash() {
+  const h = location.hash || "";
+  const m = h.match(/[#&]t=([^&]+)/);
+  return m ? decodeURIComponent(m[1]) : null;
+}
+
+const token = (getTokenFromHash() || "").trim();
+if (!token) {
+  setStatus("URLが不正です（tokenなし）", "ng");
+  startBtn.disabled = true;
+  detailEl.textContent = "Discordで /pow を実行してURLを開き直してください。";
+}
+
+function parseDiff(tok) {
+  const parts = tok.split(".");
+  return Number(parts[6]); // pow.v1.rand.guildId.userId.ts.diff.sig
+}
+
+const diff = token ? parseDiff(token) : NaN;
+if (token && !Number.isFinite(diff)) {
+  setStatus("token形式が不正です", "ng");
+  startBtn.disabled = true;
+  detailEl.textContent = "tokenが壊れている可能性があります。Discordで /pow をやり直してください。";
+}
+
+function makeWorker() {
+  const code = \`
+    function hasLeadingZeroBits(bytes, zeroBits) {
+      let bits = zeroBits;
+      for (let i = 0; i < bytes.length; i++) {
+        if (bits <= 0) return true;
+        const b = bytes[i];
+        if (bits >= 8) { if (b !== 0) return false; bits -= 8; }
+        else { const mask = 0xff << (8 - bits); return (b & mask) === 0; }
+      }
+      return bits <= 0;
+    }
+
+    async function sha256Utf8(str) {
+      const enc = new TextEncoder();
+      const buf = enc.encode(str);
+      const digest = await crypto.subtle.digest("SHA-256", buf);
+      return new Uint8Array(digest);
+    }
+
+    let stop = false;
+    self.onmessage = async (e) => {
+      const { token, diff, start, step } = e.data;
+      let nonce = start;
+      const started = Date.now();
+      while (!stop) {
+        const h = await sha256Utf8(token + "." + nonce);
+        if (hasLeadingZeroBits(h, diff)) {
+          self.postMessage({ type: "found", nonce, ms: Date.now() - started });
+          return;
+        }
+        nonce += step;
+        if (nonce % (step * 5000) === 0) {
+          self.postMessage({ type: "progress", nonce, ms: Date.now() - started });
+        }
+      }
+    };
+
+    self.addEventListener("message", (e) => {
+      if (e.data && e.data.type === "stop") stop = true;
+    });
+  \`;
+  const blob = new Blob([code], { type: "text/javascript" });
+  return new Worker(URL.createObjectURL(blob));
+}
+
+startBtn.onclick = async () => {
+  startBtn.disabled = true;
+  setStatus("計算中…（タブを閉じないでください）", "muted");
+  detailEl.textContent = "difficulty=" + diff + "\\n";
+
+  const n = Math.max(1, Math.min(navigator.hardwareConcurrency || 2, 8)); // 最大8並列
+  detailEl.textContent += "workers=" + n + "\\n";
+
+  let done = false;
+  const workers = [];
+  const startedAll = Date.now();
+
+  function stopAll() {
+    for (const w of workers) {
+      try { w.postMessage({ type: "stop" }); w.terminate(); } catch {}
+    }
+  }
+
+  for (let i = 0; i < n; i++) {
+    const w = makeWorker();
+    workers.push(w);
+
+    w.onmessage = async (ev) => {
+      const msg = ev.data;
+      if (done) return;
+
+      if (msg.type === "progress") {
+        const elapsed = ((Date.now() - startedAll) / 1000).toFixed(1);
+        progressEl.textContent = "≈ " + elapsed + "s (parallel " + n + ")";
+        return;
+      }
+
+      if (msg.type === "found") {
+        done = true;
+        stopAll();
+
+        progressEl.textContent = "nonce=" + msg.nonce + " / " + (msg.ms/1000).toFixed(1) + "s (worker)";
+        detailEl.textContent += "nonce found: " + msg.nonce + "\\n送信中…\\n";
+        setStatus("検証中…", "muted");
+
+        const r = await fetch("/api/submit", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ token: token.trim(), nonce: String(msg.nonce).trim() })
+        });
+
+        const j = await r.json().catch(() => null);
+        if (!r.ok || !j || !j.ok) {
+          setStatus("失敗: " + ((j && (j.error || j.msg)) ? (j.error || j.msg) : ("HTTP " + r.status)), "ng");
+          detailEl.textContent += "error: " + JSON.stringify(j) + "\\n";
+          startBtn.disabled = false;
+          return;
+        }
+
+        setStatus("認証完了（ロール付与済み）", "ok");
+        detailEl.textContent += "done\\n";
+      }
+    };
+
+    w.postMessage({ token, diff, start: i, step: n });
+  }
+};
+</script>
+</body>
+</html>`;
+}
+
+// -------------------- worker --------------------
 export default {
-	async fetch(request, env, ctx): Promise<Response> {
-		return new Response('Hello World!');
-	},
-} satisfies ExportedHandler<Env>;
+  async fetch(req: Request, env: Env): Promise<Response> {
+    const url = new URL(req.url);
+
+    // ---- Interactions ----
+    if (url.pathname === "/interactions") {
+      if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+
+      const bodyText = await req.text();
+      const okSig = await verifyDiscordSig(req, env, bodyText);
+      if (!okSig) return new Response("invalid signature", { status: 401 });
+
+      const interaction = JSON.parse(bodyText);
+
+      // PING
+      if (interaction.type === 1) return json({ type: 1 });
+
+      // Slash command
+      if (interaction.type === 2) {
+        const name = interaction.data?.name;
+        const guildId = interaction.guild_id;
+        const userId = interaction?.member?.user?.id;
+
+        if (!guildId || !userId) return json(ephemeral("このコマンドはサーバー内で実行してください。"));
+
+        if (name === "pow") {
+          const token = await makeToken(env, guildId, userId);
+          // キャッシュ回避のため v= を付ける。tokenは#（フラグメント）へ。
+          const verifyUrl = `${url.origin}/verify?v=${Date.now()}#t=${encodeURIComponent(token)}`;
+
+          const content =
+            `PoW認証URLを発行しました（有効 ${POW_TTL_SEC}s / difficulty=${DIFFICULTY}）。\n` +
+            `ボタンから開いて計算すると自動でロールが付与されます。`;
+
+          return json(ephemeralWithLink(content, verifyUrl));
+        }
+
+        // 互換: 手動提出用（コマンドが残っていても壊れない）
+        if (name === "pow_submit") {
+          const opts = parseOptions(interaction);
+          const token = String((opts.token ?? opts.challenge ?? "")).trim();
+          const nonce = String((opts.nonce ?? "")).trim();
+          if (!token || !nonce) return json(ephemeral("token(challenge) と nonce を指定してください。"));
+
+          const v = await verifyTokenAndPow(env, token, nonce);
+          if (!v.ok) return json(ephemeral(v.msg));
+
+          const res = await addRoleDetailed(env, v.guildId, v.userId);
+          if (!res.ok) {
+            return json(ephemeral(`ロール付与に失敗: status=${res.status} body=${res.body || "(empty)"}`));
+          }
+          return json(ephemeral("認証完了。ロールを付与しました。"));
+        }
+
+        return json(ephemeral("未対応のコマンドです。"));
+      }
+
+      return json(ephemeral("未対応のリクエストです。"));
+    }
+
+    // ---- Verify page ----
+    if (url.pathname === "/verify") {
+      return html(verifyPageHtml());
+    }
+
+    // ---- Submit ----
+    if (url.pathname === "/api/submit") {
+      if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+
+      let body: any;
+      try {
+        body = await req.json();
+      } catch {
+        return json({ ok: false, error: "invalid json" }, 400);
+      }
+
+      const token = String(body?.token ?? "").trim();
+      const nonce = String(body?.nonce ?? "").trim();
+      if (!token || !nonce) return json({ ok: false, error: "missing token/nonce" }, 400);
+
+      const v = await verifyTokenAndPow(env, token, nonce);
+      if (!v.ok) return json({ ok: false, error: v.msg, debug: (v as any).debug }, 400);
+
+      const res = await addRoleDetailed(env, v.guildId, v.userId);
+      if (!res.ok) {
+        // ここがあなたのログで失敗している箇所。status/bodyを返して原因を見える化する。
+        return json({ ok: false, error: "failed to add role (check permissions/role hierarchy)", discord: res }, 500);
+      }
+
+      return json({ ok: true });
+    }
+
+    return new Response("not found", { status: 404 });
+  },
+};
