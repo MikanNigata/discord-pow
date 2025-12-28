@@ -9,6 +9,14 @@
 	"compatibility_date": "2025-12-25",
 	"observability": {
 		"enabled": true
+	},
+	"env": {
+		"v2": {
+			"name": "discord-pow-v2",
+			"vars": {
+				"POW_COMMAND_NAME": "pow2"
+			}
+		}
 	}
 	/**
 	 * Smart Placement

@@ -5,6 +5,8 @@ interface Env {
   DISCORD_BOT_TOKEN: string;
   VERIFIED_ROLE_ID: string;
   POW_SECRET: string;
+  POW_COMMAND_NAME?: string;
+  ENABLE_VERIFY_BUTTON?: string;
 }
 
 // まずはUX優先で軽め推奨（重ければ下げ、軽すぎれば上げる）
@@ -94,6 +96,12 @@ function html(body: string, status = 200): Response {
   });
 }
 
+function isEnabled(value: string | undefined): boolean {
+  if (value === undefined) return true;
+  const v = value.trim().toLowerCase();
+  return v !== "0" && v !== "false" && v !== "off";
+}
+
 function ephemeral(content: string) {
   return { type: 4, data: { content, flags: 64 } };
 }
@@ -109,6 +117,22 @@ function ephemeralWithLink(content: string, url: string) {
         {
           type: 1,
           components: [{ type: 2, style: 5, label: "PoW認証を開始", url }],
+        },
+      ],
+    },
+  };
+}
+
+function ephemeralWithLinkLabel(content: string, url: string, label: string) {
+  return {
+    type: 4,
+    data: {
+      content,
+      flags: 64,
+      components: [
+        {
+          type: 1,
+          components: [{ type: 2, style: 5, label, url }],
         },
       ],
     },
@@ -410,15 +434,37 @@ export default {
       // PING
       if (interaction.type === 1) return json({ type: 1 });
 
+      // Message Component (button)
+      if (interaction.type === 3) {
+        if (!isEnabled(env.ENABLE_VERIFY_BUTTON)) {
+          return json(ephemeral("現在この認証ボタンは無効です。"));
+        }
+
+        const customId = interaction.data?.custom_id;
+        if (customId !== "pow_start") return json(ephemeral("未対応のボタンです。"));
+
+        const guildId = interaction.guild_id ?? interaction.guild?.id;
+        const userId = interaction.member?.user?.id ?? interaction.user?.id;
+        if (!guildId || !userId) return json(ephemeral("サーバー内で実行してください。"));
+
+        const token = await makeToken(env, guildId, userId);
+        const verifyUrl = `${url.origin}/verify?v=${Date.now()}#t=${encodeURIComponent(token)}`;
+        const content =
+          "リンクを開いてPoWを完了してください（完了後に自動でロールが付きます）。";
+
+        return json(ephemeralWithLinkLabel(content, verifyUrl, "PoWを解く"));
+      }
+
       // Slash command
       if (interaction.type === 2) {
         const name = interaction.data?.name;
         const guildId = interaction.guild_id;
         const userId = interaction?.member?.user?.id;
+        const cmd = env.POW_COMMAND_NAME ?? "pow";
 
         if (!guildId || !userId) return json(ephemeral("このコマンドはサーバー内で実行してください。"));
 
-        if (name === "pow") {
+        if (name === cmd) {
           const token = await makeToken(env, guildId, userId);
           // キャッシュ回避のため v= を付ける。tokenは#（フラグメント）へ。
           const verifyUrl = `${url.origin}/verify?v=${Date.now()}#t=${encodeURIComponent(token)}`;

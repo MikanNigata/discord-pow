@@ -4,8 +4,12 @@
 	"private": true,
 	"scripts": {
 		"deploy": "wrangler deploy",
+		"deploy:v2": "wrangler deploy --env v2",
 		"dev": "wrangler dev",
 		"start": "wrangler dev",
+		"register": "node register_commands.mjs",
+		"register:v2": "node register_commands.mjs",
+		"post:verify": "node scripts/post_verify_message.mjs",
 		"test": "vitest",
 		"cf-typegen": "wrangler types"
 	},

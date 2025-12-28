@@ -21,9 +21,11 @@ npm install
 2) Guild コマンドを登録
 ```bash
 # PowerShell 例
-$env:DISCORD_APP_ID="<app_id>"
+$env:DISCORD_APPLICATION_ID="<app_id>"
+# 互換: $env:DISCORD_APP_ID="<app_id>"
 $env:DISCORD_GUILD_ID="<guild_id>"
 $env:DISCORD_BOT_TOKEN="<bot_token>"
+# 任意: $env:POW_COMMAND_NAME="pow"
 node register_commands.mjs
 ```
 
@@ -42,6 +44,57 @@ wrangler deploy
 
 5) Discord の Interaction エンドポイントを設定
 - `https://<your-worker-domain>/interactions`
+
+## #verify 常設ボタン（認証開始）
+1) 常設メッセージを投稿
+```bash
+# PowerShell 例
+$env:VERIFY_CHANNEL_ID="<verify_channel_id>"
+$env:DISCORD_BOT_TOKEN="<bot_token>"
+npm run post:verify
+```
+
+2) 動作確認
+- #verify の「認証開始」を押すと、ephemeral で「PoWを解く」ボタンが出る
+- そのリンクで PoW を解くとロールが付与される
+- `/pow` でも従来通り動作する
+
+補足
+- 必要なら `ENABLE_VERIFY_BUTTON=false` を vars に設定してボタンを無効化できる
+
+## v2 並行稼働
+1) Discord Developer Portal で v2 用の Application / Bot を作成
+
+2) v2 用コマンド登録（POW_COMMAND_NAME は pow2 など推奨）
+```bash
+# PowerShell 例
+$env:DISCORD_APPLICATION_ID="<v2_app_id>"
+$env:DISCORD_GUILD_ID="<guild_id>"
+$env:DISCORD_BOT_TOKEN="<v2_bot_token>"
+$env:POW_COMMAND_NAME="pow2"
+npm run register:v2
+```
+
+3) v2 Worker の secrets を設定（必ず --env v2 を付ける）
+```bash
+wrangler secret put DISCORD_PUBLIC_KEY --env v2
+wrangler secret put DISCORD_BOT_TOKEN --env v2
+wrangler secret put VERIFIED_ROLE_ID --env v2
+wrangler secret put POW_SECRET --env v2
+```
+
+4) v2 デプロイ
+```bash
+npm run deploy:v2
+```
+
+5) v2 の Interaction エンドポイントを設定
+- `https://<your-v2-worker-domain>/interactions`
+
+注意
+- 旧Bot（v1）には触らない
+- 本番Guildに入れるなら v2 のコマンド名は `/pow2` や `/pow-beta` を推奨
+- v2 の検証は別Guild推奨
 
 ## 使い方
 - サーバー内で `/pow` を実行
