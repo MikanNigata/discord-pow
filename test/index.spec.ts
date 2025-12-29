@@ -258,4 +258,49 @@ describe("nonce replay protection", () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it("rejects when token difficulty is tampered", async () => {
+    const testEnv = env as any;
+    testEnv.POW_SECRET = "test-secret";
+    testEnv.DISCORD_BOT_TOKEN = "test-bot-token";
+    testEnv.VERIFIED_ROLE_ID = "role-id";
+
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.startsWith("https://discord.com/api/v10/")) {
+        return new Response("", { status: 204 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    try {
+      const diff = 1;
+      const now = Math.floor(Date.now() / 1000);
+      const exp = now + 600;
+      const token = await makeToken(
+        testEnv.POW_SECRET,
+        "guild",
+        "user",
+        testEnv.VERIFIED_ROLE_ID,
+        exp,
+        diff
+      );
+      const parts = token.split(".");
+      parts[7] = "2";
+      const tampered = parts.join(".");
+
+      const request = new IncomingRequest("http://example.com/api/submit", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token: tampered, nonce: "0", user_id: "user", guild_id: "guild" }),
+      });
+
+      const ctx = createExecutionContext();
+      const res = await worker.fetch(request, testEnv, ctx);
+      await waitOnExecutionContext(ctx);
+      expect(res.status).toBe(400);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });

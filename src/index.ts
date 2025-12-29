@@ -11,8 +11,9 @@ interface Env {
 }
 
 // まずはUX優先で軽め推奨（重ければ下げ、軽すぎれば上げる）
-const POW_TTL_SEC = 600; // 10分
-const DIFFICULTY = 20;   // 16〜20あたりで調整
+const POW_TTL_SEC = 600; // 10 min
+const DIFFICULTY_DEFAULT = 20; // 16-20 range
+const DIFFICULTY_MOBILE = 16;
 
 // -------------------- util --------------------
 function hexToU8(hex: string): Uint8Array {
@@ -126,6 +127,20 @@ function css(body: string, status = 200): Response {
   });
 }
 
+
+function getDifficultyForUserAgent(userAgent: string | null): number {
+  const ua = (userAgent ?? "").toLowerCase();
+  if (
+    ua.includes("mobile") ||
+    ua.includes("android") ||
+    ua.includes("iphone") ||
+    ua.includes("ipad")
+  ) {
+    return DIFFICULTY_MOBILE;
+  }
+  return DIFFICULTY_DEFAULT;
+}
+
 function isEnabled(value: string | undefined): boolean {
   if (value === undefined) return true;
   const v = value.trim().toLowerCase();
@@ -189,14 +204,14 @@ async function verifyDiscordSig(req: Request, env: Env, bodyText: string): Promi
 }
 
 // -------------------- token / pow --------------------
-async function makeToken(env: Env, guildId: string, userId: string): Promise<string> {
+async function makeToken(env: Env, guildId: string, userId: string, difficulty: number): Promise<string> {
   const ts = Math.floor(Date.now() / 1000);
   const exp = ts + POW_TTL_SEC;
   const tokenNonce = crypto.getRandomValues(new Uint8Array(16));
   const nonceB64u = u8ToBase64Url(tokenNonce);
 
   // pow.v1.nonce.guildId.userId.roleId.exp.diff.sig
-  const payload = `pow.v1.${nonceB64u}.${guildId}.${userId}.${env.VERIFIED_ROLE_ID}.${exp}.${DIFFICULTY}`;
+  const payload = `pow.v1.${nonceB64u}.${guildId}.${userId}.${env.VERIFIED_ROLE_ID}.${exp}.${difficulty}`;
   const sig = await hmacSha256Base64Url(env.POW_SECRET, payload);
   return `${payload}.${sig}`;
 }
@@ -527,6 +542,7 @@ export default {
       if (!okSig) return new Response("invalid signature", { status: 401 });
 
       const interaction = JSON.parse(bodyText);
+      const difficulty = getDifficultyForUserAgent(req.headers.get("user-agent"));
 
       // PING
       if (interaction.type === 1) return json({ type: 1 });
@@ -544,7 +560,7 @@ export default {
         const userId = interaction.member?.user?.id ?? interaction.user?.id;
         if (!guildId || !userId) return json(ephemeral("サーバー内で実行してください。"));
 
-        const token = await makeToken(env, guildId, userId);
+        const token = await makeToken(env, guildId, userId, difficulty);
         const verifyUrl = `${url.origin}/verify#token=${encodeURIComponent(token)}`;
         const content =
           "リンクを開いてPoWを完了してください（完了後に自動でロールが付きます）。";
@@ -562,12 +578,12 @@ export default {
         if (!guildId || !userId) return json(ephemeral("このコマンドはサーバー内で実行してください。"));
 
         if (name === cmd) {
-          const token = await makeToken(env, guildId, userId);
+          const token = await makeToken(env, guildId, userId, difficulty);
           // tokenは#（フラグメント）へ。
           const verifyUrl = `${url.origin}/verify#token=${encodeURIComponent(token)}`;
 
           const content =
-            `PoW認証URLを発行しました（有効 ${POW_TTL_SEC}s / difficulty=${DIFFICULTY}）。\n` +
+            `PoW認証URLを発行しました（有効 ${POW_TTL_SEC}s / difficulty=${difficulty}）。\n` +
             `ボタンから開いて計算すると自動でロールが付与されます。`;
 
           return json(ephemeralWithLink(content, verifyUrl));
