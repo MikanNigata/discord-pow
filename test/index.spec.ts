@@ -57,6 +57,11 @@ function createTestEnv(overrides: Record<string, unknown> = {}) {
   } as any;
 }
 
+// Hono forwards env bindings via app.fetch(req, env, ctx).
+function fetchApp(request: Request, env: any): Promise<Response> {
+  return worker.fetch(request, env);
+}
+
 function u8ToBase64Url(u8: Uint8Array): string {
   let s = "";
   for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
@@ -155,7 +160,7 @@ describe("nonce replay protection", () => {
   it("serves /verify with no-store and no-referrer headers", async () => {
     const env = createTestEnv();
     const request = new IncomingRequest("http://example.com/verify");
-    const res = await worker.fetch(request, env);
+    const res = await fetchApp(request, env);
     expect(res.headers.get("cache-control")).toContain("no-store");
     expect(res.headers.get("referrer-policy")).toBe("no-referrer");
     expect(res.headers.get("x-content-type-options")).toBe("nosniff");
@@ -194,7 +199,7 @@ describe("nonce replay protection", () => {
         body,
       });
 
-      const res1 = await worker.fetch(request, testEnv);
+      const res1 = await fetchApp(request, testEnv);
       expect(res1.status).toBe(200);
       expect(await res1.json()).toEqual({ ok: true });
 
@@ -203,7 +208,7 @@ describe("nonce replay protection", () => {
         headers: { "content-type": "application/json" },
         body,
       });
-      const res2 = await worker.fetch(replayRequest, testEnv);
+      const res2 = await fetchApp(replayRequest, testEnv);
       expect(res2.status).toBe(409);
     } finally {
       vi.unstubAllGlobals();
@@ -247,10 +252,10 @@ describe("nonce replay protection", () => {
       });
 
     try {
-      const firstResponse = await worker.fetch(makeRequest(), testEnv);
+      const firstResponse = await fetchApp(makeRequest(), testEnv);
       expect(firstResponse.status).toBe(503);
 
-      const secondResponse = await worker.fetch(makeRequest(), testEnv);
+      const secondResponse = await fetchApp(makeRequest(), testEnv);
       expect(secondResponse.status).toBe(200);
       expect(discordCalls).toBe(5);
     } finally {
@@ -280,7 +285,7 @@ describe("nonce replay protection", () => {
         body: JSON.stringify({ token, nonce: powNonce, user_id: "user", guild_id: "guild" }),
       });
 
-      const response = await worker.fetch(request, testEnv);
+      const response = await fetchApp(request, testEnv);
       expect(response.status).toBe(400);
 
       const store = new NonceStore({ storage: new MemoryStorage() } as any);
@@ -312,15 +317,15 @@ describe("nonce replay protection", () => {
       },
       body,
     });
-    expect((await worker.fetch(malformed, testEnv)).status).toBe(401);
+    expect((await fetchApp(malformed, testEnv)).status).toBe(401);
 
     const stale = signedInteractionRequest(interaction, keyPair, now - 301);
-    expect((await worker.fetch(stale, testEnv)).status).toBe(401);
+    expect((await fetchApp(stale, testEnv)).status).toBe(401);
 
     const valid = signedInteractionRequest(interaction, keyPair, now);
-    expect((await worker.fetch(valid, testEnv)).status).toBe(200);
+    expect((await fetchApp(valid, testEnv)).status).toBe(200);
     const duplicate = signedInteractionRequest(interaction, keyPair, now);
-    expect((await worker.fetch(duplicate, testEnv)).status).toBe(409);
+    expect((await fetchApp(duplicate, testEnv)).status).toBe(409);
   });
 
   it("disables pow_submit unless explicitly enabled", async () => {
@@ -331,7 +336,7 @@ describe("nonce replay protection", () => {
       keyPair
     );
 
-    const response = await worker.fetch(request, testEnv);
+    const response = await fetchApp(request, testEnv);
     expect(response.status).toBe(200);
     expect((await response.json() as any).data.content).toBe("pow_submit is disabled.");
   });
@@ -349,7 +354,7 @@ describe("nonce replay protection", () => {
     );
     request.headers.set("user-agent", "Discord/1.0 (Android; Mobile)");
 
-    const response = await worker.fetch(request, testEnv);
+    const response = await fetchApp(request, testEnv);
     expect(response.status).toBe(200);
     expect((await response.json() as any).data.content).toContain("difficulty=22");
   });
@@ -389,7 +394,7 @@ describe("nonce replay protection", () => {
         body: JSON.stringify({ token, nonce: powNonce, user_id: "user", guild_id: "guild" }),
       });
 
-      const res = await worker.fetch(request, testEnv);
+      const res = await fetchApp(request, testEnv);
       expect(res.status).toBe(200);
       expect(grantedRoleIds).toEqual([testEnv.VERIFIED_ROLE_ID, ADDITIONAL_VERIFIED_ROLE_ID_2026]);
     } finally {
@@ -433,7 +438,7 @@ describe("nonce replay protection", () => {
         body: JSON.stringify({ token, nonce: powNonce, user_id: "user", guild_id: "guild" }),
       });
 
-      const res = await worker.fetch(request, testEnv);
+      const res = await fetchApp(request, testEnv);
       expect(res.status).toBe(200);
       expect(grantedRoleIds).toEqual([testEnv.VERIFIED_ROLE_ID, ADDITIONAL_VERIFIED_ROLE_ID_2027]);
     } finally {
@@ -464,7 +469,7 @@ describe("nonce replay protection", () => {
       body: JSON.stringify({ token, nonce: powNonce, user_id: "user", guild_id: "guild" }),
     });
 
-    const res = await worker.fetch(request, testEnv);
+    const res = await fetchApp(request, testEnv);
     expect(res.status).toBe(403);
   });
 
@@ -499,7 +504,7 @@ describe("nonce replay protection", () => {
         body: JSON.stringify({ token, nonce: powNonce, user_id: "other", guild_id: "guild" }),
       });
 
-      const res = await worker.fetch(request, testEnv);
+      const res = await fetchApp(request, testEnv);
       expect(res.status).toBe(400);
     } finally {
       vi.unstubAllGlobals();
@@ -537,7 +542,7 @@ describe("nonce replay protection", () => {
         body: JSON.stringify({ token, nonce: powNonce, user_id: "user", guild_id: "other" }),
       });
 
-      const res = await worker.fetch(request, testEnv);
+      const res = await fetchApp(request, testEnv);
       expect(res.status).toBe(400);
     } finally {
       vi.unstubAllGlobals();
@@ -575,7 +580,7 @@ describe("nonce replay protection", () => {
         body: JSON.stringify({ token, nonce: powNonce, user_id: "user", guild_id: "guild" }),
       });
 
-      const res = await worker.fetch(request, testEnv);
+      const res = await fetchApp(request, testEnv);
       expect(res.status).toBe(400);
     } finally {
       vi.unstubAllGlobals();
@@ -615,7 +620,7 @@ describe("nonce replay protection", () => {
         body: JSON.stringify({ token: tampered, nonce: "0", user_id: "user", guild_id: "guild" }),
       });
 
-      const res = await worker.fetch(request, testEnv);
+      const res = await fetchApp(request, testEnv);
       expect(res.status).toBe(400);
     } finally {
       vi.unstubAllGlobals();
